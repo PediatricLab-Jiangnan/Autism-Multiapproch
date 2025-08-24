@@ -1,0 +1,436 @@
+# Load necessary packages
+library(VariantAnnotation)
+library(gwasvcf)
+library(gwasglue)
+library(TwoSampleMR)
+library(ieugwasr)
+library(dplyr)
+library(purrr)
+
+
+##############################
+#### Batch Process Exposure Data ####
+##############################
+
+# List of exposure VCF files
+exposure_files <- c("pm10.vcf.gz", "pm2.5-10.vcf.gz", "pm2.5.vcf.gz","No.vcf.gz") 
+
+# Function to process a single exposure file
+process_exposure <- function(vcf_file, pval_threshold = 1e-5) {
+  # Check if the file exists before processing
+  if(!file.exists(vcf_file)) {
+    cat("File not found:", vcf_file, "\n")
+    return(NULL)
+  }
+  
+  # Read and filter VCF file by p-value
+  exposure_vcf <- readVcf(vcf_file)
+  exposure_vcf_p_filter <- query_gwas(vcf = exposure_vcf, pval = pval_threshold)
+  exposure_data <- gwasvcf_to_TwoSampleMR(exposure_vcf_p_filter)
+  
+  # Clumping for LD independence
+  exposure_data_clumped <- ld_clump(
+    dat = tibble(rsid = exposure_data$SNP,  
+                 pval = exposure_data$pval.exposure, 
+                 id = exposure_data$exposure),
+    clump_kb = 10000,
+    clump_r2 = 0.001,
+    clump_p = 1,
+    bfile = "./EUR",
+    plink_bin = "./plink"
+  )
+  
+  # Filter by clumped SNPs and add exposure name
+  exposure_data %>% 
+    filter(SNP %in% exposure_data_clumped$rsid) %>% 
+    mutate(exposure_name = tools::file_path_sans_ext(basename(vcf_file)))
+}
+
+# Batch process all exposure files
+exposure_list <- map(exposure_files, process_exposure)
+names(exposure_list) <- tools::file_path_sans_ext(basename(exposure_files))
+
+##############################
+#### Process Outcome Data ####
+##############################
+
+# Read ASD outcome data from PGC (tab-delimited)
+cat("Reading ASD outcome data from Psychiatric Genomics Consortium...\n")
+outcome_data_raw <- read.table("ASD_MR_format.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+cat("ASD data dimensions:", dim(outcome_data_raw), "\n")
+cat("Columns:", colnames(outcome_data_raw), "\n")
+head(outcome_data_raw)
+
+# Format outcome data for TwoSampleMR
+outcome_data <- format_data(
+  outcome_data_raw,
+  type = "outcome",
+  snp_col = "rsid",
+  beta_col = "beta",
+  se_col = "se", 
+  eaf_col = "eaf",
+  effect_allele_col = "effect_allele",
+  other_allele_col = "other_allele", 
+  pval_col = "pval",
+  samplesize_col = "samplesize",
+  ncase_col = "ncase",
+  ncontrol_col = "ncontrol",
+  id_col = "id"
+)
+
+# Add outcome id if missing
+if(!"id.outcome" %in% colnames(outcome_data)) {
+  outcome_data$id.outcome <- "ASD_PGC"
+}
+
+cat("Formatted ASD data dimensions:", dim(outcome_data), "\n")
+
+##############################
+#### Odds Ratio Calculation ####
+##############################
+
+# Function to calculate OR and 95% CI for MR results
+calculate_or_ci <- function(mr_results) {
+  if(is.null(mr_results) || nrow(mr_results) == 0) {
+    return(mr_results)
+  }
+  
+  cat("    Calculating OR, input data dimensions:", dim(mr_results), "\n")
+  cat("    Input columns:", paste(colnames(mr_results), collapse = ", "), "\n")
+  
+  result_df <- mr_results
+  
+  tryCatch({
+    # Format p-value column
+    if("pval" %in% colnames(result_df)) {
+      pval_values <- result_df$pval
+      pval_numeric <- suppressWarnings(as.numeric(as.character(pval_values)))
+      pval_numeric[is.na(pval_numeric)] <- 1
+      pval_numeric[pval_numeric <= 0] <- 1e-300
+      pval_numeric[pval_numeric > 1] <- 1
+      
+      pval_formatted <- character(length(pval_numeric))
+      for(i in seq_along(pval_numeric)) {
+        if(is.na(pval_numeric[i])) {
+          pval_formatted[i] <- "NA"
+        } else if(pval_numeric[i] < 0.001) {
+          pval_formatted[i] <- format(pval_numeric[i], scientific = TRUE, digits = 3)
+        } else {
+          pval_formatted[i] <- sprintf("%.3f", pval_numeric[i])
+        }
+      }
+      result_df$pval_formatted <- pval_formatted
+    } else {
+      result_df$pval_formatted <- "NA"
+    }
+    
+    # Calculate OR and CI
+    if("b" %in% colnames(result_df) && "se" %in% colnames(result_df)) {
+      beta_values <- as.numeric(result_df$b)
+      se_values <- as.numeric(result_df$se)
+      beta_values[is.na(beta_values)] <- 0
+      se_values[is.na(se_values)] <- 1
+      
+      result_df$OR <- exp(beta_values)
+      result_df$OR_lci95 <- exp(beta_values - 1.96 * se_values)
+      result_df$OR_uci95 <- exp(beta_values + 1.96 * se_values)
+      
+      or_formatted <- character(nrow(result_df))
+      for(i in seq_len(nrow(result_df))) {
+        if(is.na(result_df$OR[i]) || is.na(result_df$OR_lci95[i]) || is.na(result_df$OR_uci95[i])) {
+          or_formatted[i] <- "Calculation failed"
+        } else {
+          or_formatted[i] <- sprintf("%.3f (%.3f-%.3f)", 
+                                     result_df$OR[i], 
+                                     result_df$OR_lci95[i], 
+                                     result_df$OR_uci95[i])
+        }
+      }
+      result_df$OR_95CI <- or_formatted
+    } else {
+      result_df$OR <- NA
+      result_df$OR_lci95 <- NA
+      result_df$OR_uci95 <- NA
+      result_df$OR_95CI <- "Missing beta or se"
+    }
+    
+    cat("    OR calculation done, output dimensions:", dim(result_df), "\n")
+    return(result_df)
+    
+  }, error = function(e) {
+    cat("    Error in OR calculation:", e$message, "\n")
+    result_df$OR <- NA
+    result_df$OR_lci95 <- NA
+    result_df$OR_uci95 <- NA
+    result_df$OR_95CI <- "Calculation failed"
+    result_df$pval_formatted <- "Format failed"
+    return(result_df)
+  })
+}
+
+##############################
+#### MR Analysis Pipeline ####
+##############################
+
+# Function to run MR analysis for a single exposure
+run_mr_analysis <- function(exposure_data, exposure_name) {
+  cat("\n=== Running MR analysis for", exposure_name, "===\n")
+  
+  tryCatch({
+    if(is.null(exposure_data) || nrow(exposure_data) == 0) {
+      stop("Exposure data is empty")
+    }
+    
+    initial_exposure_snps <- nrow(exposure_data)
+    cat("Initial exposure SNP count:", initial_exposure_snps, "\n")
+    
+    required_cols <- c("SNP", "beta.exposure", "se.exposure", "effect_allele.exposure", 
+                       "other_allele.exposure", "pval.exposure")
+    missing_cols <- setdiff(required_cols, colnames(exposure_data))
+    if(length(missing_cols) > 0) {
+      stop("Missing required columns in exposure data: ", paste(missing_cols, collapse = ", "))
+    }
+    
+    # Harmonize exposure and outcome data
+    cat("Harmonising data...\n")
+    harmonised_data <- harmonise_data(
+      exposure_dat = exposure_data,
+      outcome_dat = outcome_data
+    )
+    
+    if(is.null(harmonised_data) || nrow(harmonised_data) == 0) {
+      stop("No matching SNPs after harmonisation")
+    }
+    
+    # Summarise harmonisation
+    harmonise_summary <- harmonised_data %>%
+      summarise(
+        total_snps = n(),
+        palindromic_snps = sum(palindromic, na.rm = TRUE),
+        ambiguous_snps = sum(ambiguous, na.rm = TRUE),
+        remove_snps = sum(remove, na.rm = TRUE),
+        final_snps = sum(!remove, na.rm = TRUE),
+        .groups = 'drop'
+      )
+    
+    cat("Harmonisation summary:\n")
+    cat("  Total SNPs:", harmonise_summary$total_snps, "\n")
+    cat("  Palindromic SNPs:", harmonise_summary$palindromic_snps, "\n")
+    cat("  Ambiguous SNPs:", harmonise_summary$ambiguous_snps, "\n") 
+    cat("  Removed SNPs:", harmonise_summary$remove_snps, "\n")
+    cat("  Final SNPs:", harmonise_summary$final_snps, "\n")
+    
+    # Filter to keep only valid SNPs
+    harmonised_data_clean <- harmonised_data %>% filter(!remove)
+    
+    if(nrow(harmonised_data_clean) < 3) {
+      stop(paste("Not enough SNPs after harmonisation (", nrow(harmonised_data_clean), " < 3)"))
+    }
+    
+    # Run Mendelian Randomization
+    cat("Running MR analysis...\n")
+    mr_results <- mr(harmonised_data_clean)
+    
+    if(is.null(mr_results) || nrow(mr_results) == 0) {
+      stop("MR analysis failed, no results")
+    }
+    
+    cat("MR analysis done, calculating OR...\n")
+    mr_results_with_or <- calculate_or_ci(mr_results)
+    
+    # Print main IVW result
+    cat("\nMain MR result:\n")
+    ivw_result <- mr_results_with_or %>% 
+      filter(method == "Inverse variance weighted") %>%
+      slice(1)
+    if(nrow(ivw_result) > 0) {
+      cat(sprintf("  IVW: OR = %s, P = %s\n", 
+                  ivw_result$OR_95CI, ivw_result$pval_formatted))
+    }
+    
+    # Heterogeneity and pleiotropy tests
+    cat("Calculating heterogeneity and pleiotropy...\n")
+    heterogeneity <- mr_heterogeneity(harmonised_data_clean)
+    pleiotropy <- mr_pleiotropy_test(harmonised_data_clean)
+    
+    # Sensitivity analyses
+    cat("Running sensitivity analyses...\n")
+    cat("  Single SNP analysis...\n")
+    singlesnp_results <- mr_singlesnp(harmonised_data_clean)
+    cat("  Calculating OR for single SNP analysis...\n")
+    singlesnp_results_with_or <- calculate_or_ci(singlesnp_results)
+    
+    cat("  Leave-one-out analysis...\n")
+    leaveoneout_results <- mr_leaveoneout(harmonised_data_clean)
+    cat("  Calculating OR for leave-one-out analysis...\n")
+    leaveoneout_results_with_or <- calculate_or_ci(leaveoneout_results)
+    
+    # Generate plots
+    cat("Generating plots...\n")
+    scatter_plot <- mr_scatter_plot(mr_results, harmonised_data_clean)[[1]]
+    forest_plot <- mr_forest_plot(singlesnp_results)[[1]]
+    leaveoneout_plot <- mr_leaveoneout_plot(leaveoneout_results)[[1]]
+    funnel_plot <- mr_funnel_plot(singlesnp_results)[[1]]
+    
+    cat("Analysis completed!\n")
+    
+    # Return all results
+    return(list(
+      mr_results = mr_results_with_or,
+      heterogeneity = heterogeneity,
+      pleiotropy = pleiotropy,
+      snp_summary = harmonise_summary,
+      harmonised_data = harmonised_data,
+      singlesnp_results = singlesnp_results_with_or,
+      leaveoneout_results = leaveoneout_results_with_or,
+      scatter_plot = scatter_plot,
+      sensitivity_plots = list(
+        forest = forest_plot,
+        leaveoneout = leaveoneout_plot,
+        funnel = funnel_plot
+      )
+    ))
+    
+  }, error = function(e) {
+    cat("Error in analysis for", exposure_name, ":", e$message, "\n")
+    return(list(error = e$message))
+  })
+}
+
+##############################
+#### Batch MR Analysis ####
+##############################
+
+cat("\nStarting batch MR analysis...\n")
+results <- list()
+
+for(exp_name in names(exposure_list)) {
+  cat("\nProcessing exposure:", exp_name, "\n")
+  result <- run_mr_analysis(exposure_list[[exp_name]], exp_name)
+  results[[exp_name]] <- list(result = result)
+}
+
+##############################
+#### Save Results ####
+##############################
+
+# Create output directory for MR results
+output_dir <- "MR_Results"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Function to save all results for one exposure
+save_results <- function(result, exposure_name) {
+  tryCatch({
+    exp_dir <- file.path(output_dir, exposure_name)
+    dir.create(exp_dir, showWarnings = FALSE)
+    
+    # Save main MR results (with OR)
+    write.csv(result$mr_results, file.path(exp_dir, "mr_results_with_OR.csv"), row.names = FALSE)
+    write.csv(result$heterogeneity, file.path(exp_dir, "heterogeneity.csv"), row.names = FALSE)
+    write.csv(result$pleiotropy, file.path(exp_dir, "pleiotropy.csv"), row.names = FALSE)
+    
+    # Save SNP summary and harmonised data
+    write.csv(result$snp_summary, file.path(exp_dir, "snp_summary.csv"), row.names = FALSE)
+    write.csv(result$harmonised_data, file.path(exp_dir, "harmonised_data.csv"), row.names = FALSE)
+    
+    # Save sensitivity analysis results (with OR)
+    write.csv(result$singlesnp_results, file.path(exp_dir, "singlesnp_results_with_OR.csv"), row.names = FALSE)
+    write.csv(result$leaveoneout_results, file.path(exp_dir, "leaveoneout_results_with_OR.csv"), row.names = FALSE)
+    
+    # Save plots as PDF (use cairo_pdf for better font support)
+    ggplot2::ggsave(file.path(exp_dir, "scatter_plot.pdf"), result$scatter_plot, 
+                    device = cairo_pdf, width=10, height=8, dpi=300)
+    ggplot2::ggsave(file.path(exp_dir, "forest_plot.pdf"), result$sensitivity_plots$forest,
+                    device = cairo_pdf, width=12, height=15, dpi=300)
+    ggplot2::ggsave(file.path(exp_dir, "leaveoneout_plot.pdf"), result$sensitivity_plots$leaveoneout,
+                    device = cairo_pdf, width=10, height=12, dpi=300)
+    ggplot2::ggsave(file.path(exp_dir, "funnel_plot.pdf"), result$sensitivity_plots$funnel,
+                    device = cairo_pdf, width=10, height=8, dpi=300)
+    
+    cat("Results saved to:", exp_dir, "\n")
+  }, error = function(e) {
+    cat("Error while saving results:", e$message, "\n")
+  })
+}
+
+# Save all results
+cat("\nSaving analysis results...\n")
+for(exp_name in names(results)) {
+  result <- results[[exp_name]]$result
+  if(!is.null(result) && is.null(result$error)) {
+    save_results(result, exp_name)
+  } else {
+    error_msg <- ifelse(is.null(result), "Unknown error", result$error)
+    cat("Analysis failed for:", exp_name, "- Error:", error_msg, "\n")
+  }
+}
+
+##############################
+#### Generate Summary Report ####
+##############################
+
+# Function to generate summary report (with OR info)
+create_summary_report <- function(results) {
+  summary_data <- map_dfr(names(results), function(exp_name) {
+    result <- results[[exp_name]]$result
+    if(is.null(result) || !is.null(result$error)) {
+      error_msg <- ifelse(is.null(result), "Unknown error", result$error)
+      return(data.frame(
+        exposure = exp_name,
+        status = "Failed",
+        initial_snps = NA,
+        final_snps = NA,
+        palindromic_snps = NA,
+        removed_snps = NA,
+        ivw_beta = NA,
+        ivw_OR = NA,
+        ivw_OR_95CI = NA,
+        ivw_pval = NA,
+        error = error_msg
+      ))
+    }
+    # Extract IVW result
+    ivw_result <- result$mr_results %>% 
+      filter(method == "Inverse variance weighted") %>%
+      slice(1)
+    data.frame(
+      exposure = exp_name,
+      status = "Success",
+      initial_snps = result$snp_summary$total_snps,
+      final_snps = result$snp_summary$final_snps,
+      palindromic_snps = result$snp_summary$palindromic_snps,
+      removed_snps = result$snp_summary$remove_snps,
+      ivw_beta = ifelse(nrow(ivw_result) > 0, round(ivw_result$b, 4), NA),
+      ivw_OR = ifelse(nrow(ivw_result) > 0, round(ivw_result$OR, 3), NA),
+      ivw_OR_95CI = ifelse(nrow(ivw_result) > 0, ivw_result$OR_95CI, NA),
+      ivw_pval = ifelse(nrow(ivw_result) > 0, ivw_result$pval_formatted, NA),
+      error = NA
+    )
+  })
+  return(summary_data)
+}
+
+# Generate and save summary report
+summary_report <- create_summary_report(results)
+write.csv(summary_report, file.path(output_dir, "analysis_summary_with_OR.csv"), row.names = FALSE)
+
+cat("\n=== Analysis Summary ===\n")
+print(summary_report)
+
+# Print main IVW results if available
+success_results <- summary_report %>% filter(status == "Success")
+if(nrow(success_results) > 0) {
+  cat("\n=== Main MR Results (IVW) ===\n")
+  ivw_summary <- success_results %>%
+    select(exposure, final_snps, ivw_OR_95CI, ivw_pval) %>%
+    rename(
+      "Exposure" = exposure,
+      "Number_of_IVs" = final_snps,
+      "OR (95% CI)" = ivw_OR_95CI,
+      "P-value" = ivw_pval
+    )
+  print(ivw_summary)
+}
+
+cat("\nAnalysis completed!\n")
